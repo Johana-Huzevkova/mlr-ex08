@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Leaf Classifier — live camera</title>
+<!-- QR code is generated locally in the browser by qrcode-generator (no external QR-image service). -->
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0 auto; padding: 16px; max-width: 640px;
+    background: #f6f7f4; color: #1c2318;
+  }
+  h1 { font-size: 1.35rem; margin: 4px 0 2px; }
+  .sub { margin: 0 0 14px; color: #5a6355; font-size: .9rem; }
+  .card { background: #fff; border: 1px solid #dfe3da; border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+  video { width: 100%; border-radius: 8px; background: #000; display: block; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  button, .btnlike {
+    background: #2e6b34; color: #fff; border: 0; border-radius: 8px;
+    padding: 10px 16px; font-size: 1rem; cursor: pointer;
+  }
+  button.secondary { background: #55606b; }
+  button:disabled { background: #9aa3a0; cursor: default; }
+  #status { font-size: .85rem; color: #5a6355; min-height: 1.2em; margin-top: 8px; }
+  #modelInputBox { display: none; align-items: center; gap: 10px; margin-top: 10px; }
+  #modelInput { width: 96px; height: 96px; image-rendering: pixelated; border: 1px solid #d0d5cc; border-radius: 4px; }
+  .cls { margin: 8px 0; }
+  .cls .name { display: flex; justify-content: space-between; font-size: .95rem; }
+  .cls.top .name { font-weight: 700; }
+  .barOuter { background: #e7eae3; border-radius: 6px; height: 12px; overflow: hidden; margin-top: 3px; }
+  .bar { height: 100%; width: 0%; background: #4c9a52; border-radius: 6px; transition: width .15s linear; }
+  .cls.top .bar { background: #2e6b34; }
+  .note { font-size: .8rem; color: #78806f; margin-top: 6px; }
+  #photoModeNote { display: none; color: #8a5a10; font-weight: 600; font-size: .85rem; margin-top: 6px; }
+  #resumeLiveBtn { display: none; }
+  .qrSection { display: flex; align-items: center; gap: 18px; }
+  #qrcode svg { display: block; width: 160px; height: 160px; }
+  #qrcode table { border-collapse: collapse; }
+  #qrcode td, #qrcode th { width: 6px; height: 6px; padding: 0; }
+  .qrText { font-size: .95rem; }
+  .qrText a { word-break: break-all; color: #2e6b34; font-weight: 600; }
+  canvas.hiddenCanvas { display: none; }
+</style>
+</head>
+<body>
+<h1>🍃 Leaf Classifier</h1>
+<p class="sub">Runs <code>leaf_model.onnx</code> directly in your browser (onnxruntime-web). Point the rear camera at a leaf.</p>
+
+<div class="card">
+  <video id="video" autoplay muted playsinline></video>
+  <div class="row" style="margin-top:10px">
+    <button id="startBtn">Start camera</button>
+    <button id="resumeLiveBtn" class="secondary">← Back to live camera</button>
+  </div>
+  <div id="status">Loading model…</div>
+  <div id="modelInputBox">
+    <canvas id="modelInput" width="96" height="96"></canvas>
+    <span class="note">Exactly what the model sees: central square of the frame, resized to 96×96.</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin:0 0 4px;font-size:1.05rem">Class probabilities</h2>
+  <div id="photoModeNote">Photo result (camera paused)</div>
+  <div id="results"></div>
+  <div class="note" id="inferNote">—</div>
+</div>
+
+<div class="card">
+  <h2 style="margin:0 0 6px;font-size:1.05rem">Or choose a photo</h2>
+  <input type="file" id="fileInput" accept="image/*">
+  <div class="note">Fallback for when the camera is unavailable. The photo is processed exactly like a camera frame.</div>
+</div>
+
+<div class="card qrSection">
+  <div id="qrcode" aria-label="QR code linking to this page"></div>
+  <div class="qrText">
+    <strong>Open this page on your phone</strong><br>
+    Scan the QR code with your phone camera, or tap the link:<br>
+    <a id="pageLink" href="#" rel="noopener"></a>
+  </div>
+</div>
+
+<!-- hidden canvas used for the 96x96 preprocessing -->
+<canvas id="cap" class="hiddenCanvas" width="96" height="96"></canvas>
+<!-- machine-readable result of the headless self-test (#selftest=&lt;url&gt;); empty in normal use -->
+<pre id="selftest-result" style="display:none"></pre>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Configuration — loaded from model_info.json (kept as the single source of
+// truth alongside the model file). FALLBACK_* duplicate its content so the
+// page still works if model_info.json cannot be fetched.
+// ---------------------------------------------------------------------------
+const FALLBACK_INFO = { classes: ["apple", "cherry", "chestnut", "maple"], input_size: 96,
+                        mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225] };
+
+// Final public GitHub Pages URL of this app. The QR code and the text link
+// below are both rendered from this one constant.
+const SITE_URL = "https://johana-huzevkova.github.io/mlr-ex08/";
+
+let info = FALLBACK_INFO;
+let session = null, inputName = null, outputName = null;
+let stream = null, running = false, busy = false, photoMode = false;
+const capCanvas = document.getElementById("cap");
+const capCtx = capCanvas.getContext("2d", { willReadFrequently: true });
+const video = document.getElementById("video");
+const statusEl = document.getElementById("status");
+
+// ---------------------------------------------------------------------------
+// Preprocessing (follows model_info.json exactly):
+//   central square crop of the source  ->  resize to input_size x input_size
+//   -> RGB pixels scaled to 0..1       ->  per-channel (x - mean) / std
+//   -> float32 CHW tensor with shape 1 x 3 x size x size
+// ---------------------------------------------------------------------------
+function tensorFromSource(source, srcW, srcH) {
+  const S = info.input_size;
+  const side = Math.min(srcW, srcH);
+  const sx = (srcW - side) / 2, sy = (srcH - side) / 2;
+  capCanvas.width = S; capCanvas.height = S;
+  capCtx.imageSmoothingEnabled = true;
+  capCtx.imageSmoothingQuality = "high";
+  capCtx.drawImage(source, sx, sy, side, side, 0, 0, S, S);
+  const rgba = capCtx.getImageData(0, 0, S, S).data;
+  const data = new Float32Array(3 * S * S);
+  const m = info.mean, s = info.std;
+  for (let i = 0; i < S * S; i++) {
+    const p = i * 4;
+    data[i]             = (rgba[p]     / 255 - m[0]) / s[0]; // R
+    data[S * S + i]     = (rgba[p + 1] / 255 - m[1]) / s[1]; // G
+    data[2 * S * S + i] = (rgba[p + 2] / 255 - m[2]) / s[2]; // B
+  }
+  return { tensor: new ort.Tensor("float32", data, [1, 3, S, S]),
+           thumb: capCanvas };
+}
+
+// The model's last layer emits raw scores. Convert to probabilities:
+// softmax, unless the output is already a probability distribution.
+function toProbs(raw) {
+  const arr = Array.from(raw);
+  const inRange = arr.every(v => v >= 0 && v <= 1);
+  const sum = arr.reduce((a, b) => a + b, 0);
+  if (inRange && Math.abs(sum - 1) < 1e-3) return arr; // already probabilities
+  const mx = Math.max(...arr);
+  const ex = arr.map(v => Math.exp(v - mx));
+  const t = ex.reduce((a, b) => a + b, 0);
+  return ex.map(v => v / t);
+}
+
+async function classify(source, srcW, srcH) {
+  const { tensor } = tensorFromSource(source, srcW, srcH);
+  const feeds = {}; feeds[inputName] = tensor;
+  const results = await session.run(feeds);
+  const out = results[outputName];
+  return toProbs(out.data.subarray(0, info.classes.length));
+}
+
+// ---------------------------------------------------------------------------
+// Results UI
+// ---------------------------------------------------------------------------
+const resultsEl = document.getElementById("results");
+function buildRows() {
+  resultsEl.innerHTML = "";
+  for (const c of info.classes) {
+    const div = document.createElement("div");
+    div.className = "cls"; div.dataset.cls = c;
+    div.innerHTML = `<div class="name"><span>${c}</span><span class="pct">—</span></div>
+                     <div class="barOuter"><div class="bar"></div></div>`;
+    resultsEl.appendChild(div);
+  }
+}
+function showProbs(probs, ms) {
+  const best = probs.indexOf(Math.max(...probs));
+  const rows = resultsEl.children;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i], isTop = i === best;
+    r.classList.toggle("top", isTop);
+    r.querySelector(".pct").textContent = (probs[i] * 100).toFixed(1) + "%";
+    r.querySelector(".bar").style.width = (probs[i] * 100).toFixed(1) + "%";
+  }
+  document.getElementById("inferNote").textContent =
+    info.classes[best] + " — " + (probs[best] * 100).toFixed(1) + "%   (" + ms.toFixed(0) + " ms)";
+}
+
+// ---------------------------------------------------------------------------
+// Model loading
+// ---------------------------------------------------------------------------
+async function loadModel() {
+  try {
+    const r = await fetch("model_info.json");
+    if (r.ok) info = Object.assign({}, FALLBACK_INFO, await r.json());
+  } catch (e) { /* keep fallback */ }
+  buildRows();
+  // GitHub Pages serves no cross-origin isolation headers, so keep WASM
+  // single-threaded (SharedArrayBuffer is unavailable there).
+  ort.env.wasm.numThreads = 1;
+  session = await ort.InferenceSession.create("leaf_model.onnx", { executionProviders: ["wasm"] });
+  inputName = session.inputNames[0];
+  outputName = session.outputNames[0];
+  statusEl.textContent = "Model ready (" + inputName + " → " + outputName + ").";
+  document.getElementById("modelInputBox").style.display = "flex";
+}
+
+// ---------------------------------------------------------------------------
+// Live camera loop
+// ---------------------------------------------------------------------------
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    statusEl.textContent = "Camera API unavailable. Use HTTPS or the photo upload below.";
+    return;
+  }
+  if (!window.isSecureContext) {
+    statusEl.textContent = "Camera needs HTTPS (or localhost). Use the photo upload, or open the Pages URL.";
+    return;
+  }
+  statusEl.textContent = "Requesting camera…";
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } }, audio: false });
+  } catch (e) {
+    statusEl.textContent = "Camera not available (" + e.name + "). You can use the photo upload below.";
+    return;
+  }
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  document.getElementById("startBtn").disabled = true;
+  running = true; photoMode = false;
+  document.getElementById("photoModeNote").style.display = "none";
+  document.getElementById("resumeLiveBtn").style.display = "none";
+  statusEl.textContent = "Classifying live…";
+  requestAnimationFrame(loop);
+}
+
+async function loop() {
+  if (!running) return;
+  if (!busy && session && video.readyState >= 2 && video.videoWidth > 0) {
+    busy = true;
+    try {
+      const t0 = performance.now();
+      const probs = await classify(video, video.videoWidth, video.videoHeight);
+      if (!photoMode) showProbs(probs, performance.now() - t0);
+    } catch (e) { statusEl.textContent = "Inference error: " + e; }
+    busy = false;
+  }
+  setTimeout(() => requestAnimationFrame(loop), 100); // ~throttle to a few fps
+}
+
+document.getElementById("startBtn").addEventListener("click", startCamera);
+document.getElementById("resumeLiveBtn").addEventListener("click", () => {
+  photoMode = false;
+  document.getElementById("photoModeNote").style.display = "none";
+  document.getElementById("resumeLiveBtn").style.display = "none";
+});
+
+// ---------------------------------------------------------------------------
+// Photo upload fallback — identical preprocessing path
+// ---------------------------------------------------------------------------
+document.getElementById("fileInput").addEventListener("change", async (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file || !session) return;
+  try {
+    const bmp = await createImageBitmap(file);
+    const t0 = performance.now();
+    const probs = await classify(bmp, bmp.width, bmp.height);
+    showProbs(probs, performance.now() - t0);
+    photoMode = true;
+    document.getElementById("photoModeNote").style.display = "block";
+    document.getElementById("resumeLiveBtn").style.display = "inline-block";
+    statusEl.textContent = "Photo classified.";
+  } catch (e) { statusEl.textContent = "Could not read image: " + e; }
+});
+
+// ---------------------------------------------------------------------------
+// QR code (generated locally in the browser from SITE_URL)
+// ---------------------------------------------------------------------------
+function renderQR() {
+  const link = document.getElementById("pageLink");
+  link.href = SITE_URL; link.textContent = SITE_URL;
+  try {
+    const qr = qrcode(0, "M");
+    qr.addData(SITE_URL);
+    qr.make();
+    document.getElementById("qrcode").innerHTML = qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true });
+  } catch (e) {
+    document.getElementById("qrcode").textContent = "(QR unavailable offline — link still works)";
+  }
+}
+renderQR();
+
+const modelReady = loadModel().catch(e => {
+  statusEl.textContent = "Model failed to load: " + e;
+});
+
+// Try the live camera automatically; the Start button remains as a retry.
+modelReady.then(() => { if (!stream) startCamera(); });
+
+// ---------------------------------------------------------------------------
+// Headless self-test:  index.html#selftest=check_image.jpg
+// runs the normal photo pipeline on that image and puts the exact JSON
+// probabilities into <pre id="selftest-result"> for automated checking.
+// ---------------------------------------------------------------------------
+(async () => {
+  const m = location.hash.match(/^#selftest=(.+)$/);
+  if (!m) return;
+  const out = document.getElementById("selftest-result");
+  try {
+    await modelReady;
+    const bmp = await createImageBitmap(await (await fetch(m[1])).blob());
+    const probs = await classify(bmp, bmp.width, bmp.height);
+    showProbs(probs, 0); // also exercise the on-screen result rows
+    const obj = {};
+    info.classes.forEach((c, i) => { obj[c] = probs[i]; });
+    out.textContent = "SELFTEST " + JSON.stringify(obj) + " " +
+      JSON.stringify({ qrSvg: !!document.querySelector("#qrcode svg"),
+                       link: document.getElementById("pageLink").href });
+  } catch (e) {
+    out.textContent = "SELFTEST-ERROR " + e;
+  }
+})();
+</script>
+</body>
+</html>

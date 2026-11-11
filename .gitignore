@@ -1,0 +1,7 @@
+# local work artifacts — not part of the published site
+ex08_for_agent.zip
+ex08_extracted*/
+tools/
+PLAN.md
+RUNS.md
+__pycache__/
